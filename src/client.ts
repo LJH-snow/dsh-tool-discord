@@ -1,5 +1,7 @@
 /** Discord REST v10 client with injected fetch for deterministic tests. */
 
+import { assertSafeUrl, EndpointSecurityError, normalizeBaseUrl, type LookupImpl } from './url-security.js'
+
 export interface DiscordClientOptions {
   /** Discord bot token. It is never returned in canonical tool values. */
   token?: string
@@ -9,6 +11,8 @@ export interface DiscordClientOptions {
   timeoutMs?: number
   /** Fetch implementation for tests or a host transport. */
   fetchImpl?: typeof fetch
+  /** Test-only DNS lookup override; production uses node:dns/promises. */
+  lookupImpl?: LookupImpl
 }
 
 export type DiscordAction = 'add' | 'remove'
@@ -97,13 +101,20 @@ export class DiscordClient {
   private readonly baseUrl: string
   private readonly timeoutMs: number
   private readonly fetchImpl: typeof fetch
+  private readonly lookupImpl: LookupImpl | undefined
 
   constructor(private readonly options: DiscordClientOptions = {}) {
     this.token = options.token ?? ''
-    this.baseUrl = (options.baseUrl ?? 'https://discord.com/api/v10').replace(/\/+$/, '')
+    try {
+      this.baseUrl = normalizeBaseUrl(options.baseUrl, 'https://discord.com/api/v10')
+    } catch (error) {
+      if (error instanceof EndpointSecurityError) throw new DiscordError(error.message, 400)
+      throw error
+    }
     this.timeoutMs = options.timeoutMs ?? 15_000
     if (!Number.isFinite(this.timeoutMs) || this.timeoutMs <= 0) throw new Error('timeoutMs must be a positive finite number.')
     this.fetchImpl = options.fetchImpl ?? globalThis.fetch
+    this.lookupImpl = options.lookupImpl
   }
 
   hasToken(): boolean { return this.token.length > 0 }
@@ -188,7 +199,14 @@ export class DiscordClient {
     try {
       const headers: Record<string, string> = { accept: 'application/json', authorization: 'Bot ' + this.token }
       if (init.body !== undefined && init.body !== null) headers['content-type'] = 'application/json'
-      const response = await this.fetchImpl(this.baseUrl + path, { ...init, headers: { ...headers, ...init.headers }, signal: controller.signal })
+      const url = new URL(this.baseUrl + path)
+      try {
+        await assertSafeUrl(url, this.lookupImpl)
+      } catch (error) {
+        if (error instanceof EndpointSecurityError) throw new DiscordError(error.message, 400)
+        throw error
+      }
+      const response = await this.fetchImpl(url.toString(), { ...init, headers: { ...headers, ...init.headers }, signal: controller.signal })
       if (!response.ok) {
         let message = 'Discord API request failed with status ' + response.status
         let code: number | undefined
